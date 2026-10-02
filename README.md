@@ -429,11 +429,315 @@ export class AuthService {
 ---
 
 
+#### `src/admin/dto/update-role.dto.ts`
+```bash
+import { IsEnum } from 'class-validator';
+import { Role } from 'generated/prisma/client';
+
+export class UpdateRoleDto {
+  @IsEnum(Role, { message: 'role must be a valid Role' })
+  role!: Role;
+}
+```
+---
+
+
+#### `src/admin/admin.service.ts`
+```bash
+import {
+  ForbiddenException,
+  Injectable,
+  NotFoundException,
+} from '@nestjs/common';
+import { InjectPinoLogger, PinoLogger } from 'nestjs-pino';
+import { Role } from 'generated/prisma/client';
+import { PrismaService } from '../prisma/prisma.service';
+import { AuthUser } from '../auth/types/auth-user.type';
+
+const USER_SELECT = {
+  id: true,
+  email: true,
+  role: true,
+  createdAt: true,
+} as const;
+
+@Injectable()
+export class AdminService {
+  constructor(
+    private readonly prisma: PrismaService,
+    @InjectPinoLogger(AdminService.name)
+    private readonly logger: PinoLogger,
+  ) {}
+
+  async listUsers(page: number, limit: number) {
+    const take = Math.min(Math.max(limit, 1), 100); // hard cap
+    const skip = (Math.max(page, 1) - 1) * take;
+
+    const [items, total] = await this.prisma.$transaction([
+      this.prisma.user.findMany({
+        skip,
+        take,
+        orderBy: { createdAt: 'desc' },
+        select: USER_SELECT,
+      }),
+      this.prisma.user.count(),
+    ]);
+
+    return { items, total, page, limit: take };
+  }
+
+  async updateRole(actor: AuthUser, targetId: string, newRole: Role) {
+    if (actor.sub === targetId) {
+      throw new ForbiddenException({
+        message: 'You cannot change your own role',
+        errorType: 'ADMIN_SELF_ROLE_CHANGE',
+      });
+    }
+
+    const target = await this.prisma.user.findUnique({
+      where: { id: targetId },
+      select: USER_SELECT,
+    });
+
+    if (!target) {
+      throw new NotFoundException({
+        message: 'User not found',
+        errorType: 'USER_NOT_FOUND',
+      });
+    }
+
+    if (target.role === newRole) return target;
+
+    // Role update + revoke all sessions atomically,
+    // so the old role cannot survive through an existing refresh token.
+    const [updated] = await this.prisma.$transaction([
+      this.prisma.user.update({
+        where: { id: targetId },
+        data: { role: newRole },
+        select: USER_SELECT,
+      }),
+      this.prisma.refreshToken.updateMany({
+        where: { userId: targetId, revokedAt: null },
+        data: { revokedAt: new Date() },
+      }),
+    ]);
+
+    // Audit log
+    this.logger.warn(
+      { actorId: actor.sub, targetId, from: target.role, to: newRole },
+      'User role changed',
+    );
+
+    return updated;
+  }
+}
+```
+---
+
+
+#### `src/admin/admin.controller.ts`
+```bash
+import {
+  Body,
+  Controller,
+  DefaultValuePipe,
+  Get,
+  Param,
+  ParseIntPipe,
+  Patch,
+  Query,
+  Req,
+} from '@nestjs/common';
+import type { Request } from 'express';
+import { Role } from 'generated/prisma/client';
+import { AdminService } from './admin.service';
+import { UpdateRoleDto } from './dto/update-role.dto';
+import { Auth } from '../common/decorators/auth.decorator';
+import { AuthUser } from '../auth/types/auth-user.type';
+
+@Controller('admin')
+export class AdminController {
+  constructor(private readonly adminService: AdminService) {}
+
+  @Auth(Role.ADMIN, Role.SUPER_ADMIN)
+  @Get('users')
+  listUsers(
+    @Query('page', new DefaultValuePipe(1), ParseIntPipe) page: number,
+    @Query('limit', new DefaultValuePipe(20), ParseIntPipe) limit: number,
+  ) {
+    return this.adminService.listUsers(page, limit);
+  }
+
+  @Auth(Role.SUPER_ADMIN)
+  @Patch('users/:id/role')
+  updateRole(
+    @Req() req: Request,
+    @Param('id') id: string,
+    @Body() dto: UpdateRoleDto,
+  ) {
+    return this.adminService.updateRole(req['user'] as AuthUser, id, dto.role);
+  }
+}
+```
+---
+
+
+#### `src/admin/admin.module.ts`
+```bash
+import { Module } from '@nestjs/common';
+import { AdminService } from './admin.service';
+import { AdminController } from './admin.controller';
+import { AuthModule } from '../auth/auth.module';
+
+@Module({
+  imports: [AuthModule], // JwtService lagbe JwtAuthGuard-er jonno
+  providers: [AdminService],
+  controllers: [AdminController],
+})
+export class AdminModule {}
+```
+---
+
+
+#### `auth.module.ts`
+```bash
+import { Module } from '@nestjs/common';
+import { AuthService } from './auth.service';
+import { AuthController } from './auth.controller';
+import { JwtModule } from '@nestjs/jwt';
+import { ConfigModule, ConfigService } from '@nestjs/config';
+import type { StringValue } from 'ms';
+
+@Module({
+  imports: [JwtModule.registerAsync({
+    imports: [ConfigModule],
+    inject: [ConfigService],
+    useFactory: (config: ConfigService) => ({
+      secret: config.getOrThrow<string>('JWT_ACCESS_SECRET'),
+      signOptions: {
+        expiresIn: config.get<StringValue>('JWT_ACCESS_EXPIRY'),
+      },
+    })
+  }),],
+  providers: [AuthService],
+  controllers: [AuthController],
+  exports: [JwtModule],
+})
+export class AuthModule {}
+```
+---
+
+
+#### `auth.controller.ts`
+```bash
+import { Body, Controller, Post, HttpCode, HttpStatus, Res, Req, UnauthorizedException, Get } from '@nestjs/common';
+import { AuthService } from './auth.service';
+import { RegisterDto } from './dto/register.dto';
+import { LoginDto } from './dto/login.dto'
+import type { Response, Request } from 'express';
+import { UseGuards } from '@nestjs/common';
+import { JwtAuthGuard } from './guards/jwt-auth.guard';
+import { Throttle } from '@nestjs/throttler';
+import { generateCsrfToken } from '../common/csrf/csrf.config';
+import { Auth } from '../common/decorators/auth.decorator';
+
+
+@Controller('auth')
+export class AuthController {
+  constructor(private readonly authService: AuthService) {}
+
+  @Post('register')
+  @HttpCode(HttpStatus.CREATED)
+  @Throttle({ default: { limit: 3, ttl: 60000 } }) // 1 min-এ max 3 বার
+  register(@Body() dto: RegisterDto) {
+    return this.authService.register(dto);
+  }
+
+  @Post('login')
+  @HttpCode(HttpStatus.OK)
+  @Throttle({ default: { limit: 5, ttl: 60000 } }) // 1 min-এ max 5 বার
+  async login(
+    @Body() dto: LoginDto,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const { user, accessToken, refreshToken } = await this.authService.login(dto);
+
+    res.cookie('refresh_token', refreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production', // dev-এ HTTPS না থাকলে false লাগবে
+      sameSite: 'strict',
+      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days, JWT_REFRESH_EXPIRY-র সাথে match রাখা
+      path: '/auth', // শুধু auth routes-এ পাঠানো হবে
+    });
+
+    return { user, accessToken };
+    // refreshToken response body-তে কখনো ফেরত যাবে না — শুধু cookie-তে
+  }
+
+  @Post('logout')
+  @HttpCode(HttpStatus.OK)
+  async logout(
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    await this.authService.logout(req.cookies?.['refresh_token']);
+
+    res.clearCookie('refresh_token', {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      path: '/auth', // set করার সময়ের path-এর সাথে মিলতে হবে, নাহলে cookie মুছবে না
+    });
+
+    return { message: 'Logged out' };
+  }
+
+  @Post('refresh')
+  @HttpCode(HttpStatus.OK)
+  async refresh(
+    @Req() req: Request,
+    @Res({ passthrough: true }) res: Response,
+  ) {
+    const oldRefreshToken = (req as Request & { cookies?: Record<string, string> }).cookies?.['refresh_token'];
+
+    if (!oldRefreshToken) {
+      throw new UnauthorizedException('Refresh token পাওয়া যায়নি');
+    }
+
+    const { user, accessToken, refreshToken } =
+      await this.authService.refreshTokens(oldRefreshToken);
+
+    res.cookie('refresh_token', refreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+      path: '/auth',
+    });
+
+    return { user, accessToken };
+  }
+
+  @UseGuards(JwtAuthGuard)
+  @Auth()
+  @Get('me')
+  getProfile(@Req() req: Request) {
+    return req['user'];  // { sub, email, role, iat, exp }
+  }
+
+  @Get('csrf-token')
+  getCsrfToken(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
+    const token = generateCsrfToken(req, res);
+    return { csrfToken: token };
+  }
+
+}
+```
+---
+
+
 #### ``
 ```bash
 
 ```
 ---
-
-
-
