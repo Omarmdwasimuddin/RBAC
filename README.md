@@ -57,3 +57,43 @@ model RefreshToken {
 ---
 
 #### [NestJS Production-Level Authentication: Signup & Login](https://github.com/Omarmdwasimuddin/NestJS-Production-Level-Signup-Login) ---> eta complete koro agee.
+
+
+#### Create files
+```bash
+mkdir -p src/auth/types
+```
+```bash
+mkdir -p src/common/decorators
+```
+```bash
+mkdir -p src/admin/dto
+```
+```bash
+New-Item -ItemType File -Path src/auth/types/auth-user.type.ts
+```
+```bash
+New-Item -ItemType File -Path src/auth/guards/roles.guard.ts
+```
+```bash
+New-Item -ItemType File -Path src/common/decorators/roles.decorator.ts
+```
+```bash
+New-Item -ItemType File -Path src/common/decorators/auth.decorator.ts
+```
+```bash
+New-Item -ItemType File -Path src/admin/dto/update-role.dto.ts
+```
+---
+
+#### Generate Admin module, service, controller
+```bash
+nest g module admin
+```
+```bash
+nest g service admin
+```
+```bash
+nest g controller admin
+```
+---
