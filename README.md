@@ -734,3 +734,18 @@ export class AuthController {
 }
 ```
 ---
+
+
+#### Supabase SQL Editor-e role set koro
+- Supabase dashboard e project open koro.
+- Left sidebar theke SQL Editor e jao, New query click koro.
+- Eta paste kore Run koro (email-ta tomar register kora email diye replace koro):
+```bash
+UPDATE "users" SET role = 'SUPER_ADMIN' WHERE email = 'your@email.com';
+```
+> Output-e Success. No rows returned dekhabe, eta normal (UPDATE row return kore na).
+```bash
+SELECT id, email, role FROM "users" WHERE email = 'your@email.com';
+```
+> role column-e SUPER_ADMIN dekhte hobe. Row na ashle email vul ache.
+---
